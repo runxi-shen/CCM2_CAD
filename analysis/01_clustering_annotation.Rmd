@@ -1,0 +1,1260 @@
+---
+title: "CCM2 Het KO Mice Aorta scRNA-seq: All Cell Clustering and Annotation"
+author: "Shi Fang"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Overview
+This analysis performs clustering and annotation of all cells from scRNA-seq data of aortic tissue from CCM2 heterozygous knockout (Het) and wild-type (WT) mice at two timepoints: Week 0 (baseline) and Week 12 (PCSK9-induced atherosclerosis).
+
+**Data availability:** Raw data is available from GEO: [GSE315884](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE315884)
+
+## Experimental Design
+- **Samples:** 4 samples total
+  - CCM2WTWeek0: Wild-type, baseline
+  - CCM2HetWeek0: CCM2 Het KO, baseline
+  - CCM2WTWeek12: Wild-type, 12 weeks post PCSK9
+  - CCM2HetWeek12: CCM2 Het KO, 12 weeks post PCSK9
+- **Preprocessing:** CellBender ambient RNA removal, Scanpy QC (Scrublet doublet detection, cell filtering: nUMI >500, nGene >250, log10GenesPerUMI >0.8, mitoRatio <0.2)
+
+# Setup
+
+## Load Libraries
+```{r load_libraries}
+# Core packages
+library(Seurat)
+library(harmony)
+library(qs)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(stringr)
+library(ggplot2)
+library(ggrepel)
+library(purrr)
+library(readr)
+
+# Gene set analysis
+library(msigdbr)
+library(clusterProfiler)
+
+# Gene ID conversion (for MAGMA)
+library(org.Mm.eg.db)
+library(org.Hs.eg.db)
+library(Orthology.eg.db)
+library(AnnotationDbi)
+
+# File output
+library(writexl)
+```
+
+## Define Themes and Color Palettes
+```{r define_themes}
+# Group colors for consistent plotting
+group_colors <- c(
+  "WT_Week0" = "blue",
+  "Het_Week0" = "green3", 
+  "WT_Week12" = "red", 
+  "Het_Week12" = "orange"
+)
+
+# Theme for heatmaps
+mytheme <- theme_classic() + 
+  theme(
+    axis.text = element_text(size = 10, face = "bold"),
+    axis.title = element_text(size = 8),
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 10),
+    axis.line = element_line(color = "black", size = 0.25),
+    axis.ticks = element_line(color = "black", size = 0.25),
+    legend.key.size = unit(10, units = "pt"),
+    legend.text = element_text(size = 7),
+    legend.title = element_text(size = 8)
+  )
+
+# Theme for bubble plots
+bubbleplot_theme <- theme(
+  axis.text.x = element_text(angle = 45, hjust = 1, size = 11),
+  axis.text.y = element_text(size = 9),
+  panel.grid.major = element_line(color = "grey", linewidth = 0.2),
+  panel.grid.minor = element_blank(),
+  panel.border = element_rect(color = "black", fill = NA, linewidth = 1)
+)
+
+# Theme for volcano plots
+volcanoplot_theme <- list(
+  geom_vline(xintercept = c(-0.5, 0.5), col = "gray", linetype = 'dashed'),
+  geom_hline(yintercept = -log10(0.05), col = "gray", linetype = 'dashed'),
+  geom_point(size = 2),
+  scale_color_manual(
+    values = c("Downregulated" = "#00AFBB", "Not significant" = "grey", "Upregulated" = "#bb0c00"),
+    labels = c("Downregulated", "Not significant", "Upregulated")
+  ),
+  theme_minimal(),
+  theme(
+    axis.text = element_text(size = 10),
+    axis.title = element_text(size = 12, face = "bold"),
+    plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
+    legend.text = element_text(size = 10)
+  )
+)
+```
+
+## Set Paths
+```{r set_paths}
+# Input data directory (preprocessed RDS files from Python pipeline)
+data_dir <- "data/"
+
+# Output directories
+results_dir <- "results/"
+figures_dir <- "figures/"
+
+# Create directories if they don't exist
+dir.create(results_dir, showWarnings = FALSE, recursive = TRUE)
+dir.create(figures_dir, showWarnings = FALSE, recursive = TRUE)
+dir.create(file.path(results_dir, "GSEA"), showWarnings = FALSE)
+dir.create(file.path(results_dir, "MASC"), showWarnings = FALSE)
+dir.create(file.path(results_dir, "MAGMA"), showWarnings = FALSE)
+```
+
+# 1. Load Preprocessed Data
+
+The input files are RDS files converted from h5ad (AnnData) objects after CellBender and Scanpy preprocessing.
+
+```{r load_data}
+# Load preprocessed Seurat objects (converted from h5ad after CellBender + Scanpy QC)
+# These files should be placed in the data/ directory
+
+CCM2WTWeek0 <- readRDS(file.path(data_dir, "CCM2WTWeek0_preprocessed.rds"))
+CCM2HetWeek0 <- readRDS(file.path(data_dir, "CCM2HetWeek0_preprocessed.rds"))
+CCM2WTWeek12 <- readRDS(file.path(data_dir, "CCM2WTWeek12_preprocessed.rds"))
+CCM2HetWeek12 <- readRDS(file.path(data_dir, "CCM2HetWeek12_preprocessed.rds"))
+
+# Add metadata
+CCM2WTWeek0@meta.data$orig.ident <- "CCM2WTWeek0"
+CCM2WTWeek0@meta.data$group <- "WT_Week0"
+
+CCM2HetWeek0@meta.data$orig.ident <- "CCM2HetWeek0"
+CCM2HetWeek0@meta.data$group <- "Het_Week0"
+
+CCM2WTWeek12@meta.data$orig.ident <- "CCM2WTWeek12"
+CCM2WTWeek12@meta.data$group <- "WT_Week12"
+
+CCM2HetWeek12@meta.data$orig.ident <- "CCM2HetWeek12"
+CCM2HetWeek12@meta.data$group <- "Het_Week12"
+
+# Merge all samples
+all_samples <- merge(
+  x = CCM2WTWeek0, 
+  y = c(CCM2HetWeek0, CCM2WTWeek12, CCM2HetWeek12),
+  add.cell.ids = c("WTW0", "HetW0", "WTW12", "HetW12")
+)
+
+# Save merged object
+qsave(all_samples, file.path(results_dir, "all_samples_merged.qs"))
+```
+
+# 2. Gene-Level Filtering
+
+Cell-level filtering was already performed in Python (CellBender, Scrublet, QC metrics). Here we perform gene-level filtering.
+
+```{r gene_filtering}
+# Extract counts
+counts <- GetAssayData(all_samples, assay = "RNA", layer = 'counts')
+
+# Keep genes expressed in at least 10 cells
+nonzero <- counts > 0
+keep_genes <- Matrix::rowSums(nonzero) >= 10
+filtered_counts <- counts[keep_genes, ]
+
+# Create filtered Seurat object
+filtered_all_seurat <- CreateSeuratObject(
+  filtered_counts, 
+  meta.data = all_samples@meta.data
+)
+
+# Report filtering results
+cat("Genes before filtering:", nrow(counts), "\n")
+cat("Genes after filtering:", nrow(filtered_counts), "\n")
+cat("Genes removed:", nrow(counts) - nrow(filtered_counts), "\n")
+
+qsave(filtered_all_seurat, file.path(results_dir, "filtered_all_seurat.qs"))
+```
+
+# 3. Clustering and Integration
+
+## Normalization, Integration, and Dimension Reduction
+
+```{r clustering, eval=FALSE}
+# Note: SCTransform is memory-intensive. This was run on HPC.
+# If running locally with sufficient memory (>32GB), set eval=TRUE
+
+filtered_all_seurat <- filtered_all_seurat %>%
+  NormalizeData() %>%
+  FindVariableFeatures(selection.method = "vst", nfeatures = 2000) %>%
+  ScaleData()
+
+filtered_all_seurat <- SCTransform(filtered_all_seurat, vst.flavor = "v2")
+
+filtered_all_seurat <- RunPCA(filtered_all_seurat, assay = "SCT", npcs = 50)
+
+# Harmony integration by group
+filtered_all_seurat <- RunHarmony(
+  filtered_all_seurat, 
+  group.by.vars = "group", 
+  reduction = "pca", 
+  assay.use = "SCT", 
+  reduction.save = "harmony"
+)
+
+# Clustering at multiple resolutions for exploration
+filtered_all_seurat <- FindNeighbors(filtered_all_seurat, reduction = "harmony")
+filtered_all_seurat <- FindClusters(
+  filtered_all_seurat, 
+  resolution = c(0.01, 0.02, 0.03, 0.04, 0.05, 0.1, 0.2, 0.3, 0.4, 0.6)
+)
+filtered_all_seurat <- RunUMAP(
+  filtered_all_seurat, 
+  reduction = "harmony", 
+  assay = "SCT", 
+  dims = 1:50
+)
+
+qsave(filtered_all_seurat, file.path(results_dir, "filtered_all_seurat_SCT_harmony.qs"))
+```
+
+```{r load_clustered}
+# Load pre-computed clustered object
+filtered_all_seurat <- qread(file.path(results_dir, "filtered_all_seurat_SCT_harmony.qs"))
+
+# Reorder groups for consistent plotting
+meta.data <- filtered_all_seurat@meta.data
+meta.data$group <- factor(meta.data$group, levels = c("WT_Week0", "Het_Week0", "WT_Week12", "Het_Week12"))
+filtered_all_seurat@meta.data <- meta.data
+```
+
+## Resolution Selection
+
+We tested multiple clustering resolutions to find optimal separation of cell types.
+
+```{r resolution_selection}
+# Visualize different resolutions
+DimPlot(filtered_all_seurat, group.by = "SCT_snn_res.0.1", label = TRUE, label.size = 4) +
+  ggtitle("Resolution 0.1")
+
+DimPlot(filtered_all_seurat, group.by = "SCT_snn_res.0.3", label = TRUE, label.size = 4) +
+  ggtitle("Resolution 0.3")
+
+# Split by group
+DimPlot(filtered_all_seurat, split.by = "group", group.by = "SCT_snn_res.0.3", 
+        label = TRUE, label.size = 6)
+
+# Find cluster markers at resolution 0.3
+Idents(filtered_all_seurat) <- filtered_all_seurat$SCT_snn_res.0.3
+
+Clustermarkers_res0.3 <- FindAllMarkers(
+  filtered_all_seurat, 
+  assay = "SCT", 
+  only.pos = TRUE, 
+  min.pct = 0.25, 
+  logfc.threshold = 0.25
+)
+
+top20_markers_res0.3 <- Clustermarkers_res0.3 %>% 
+  group_by(cluster) %>% 
+  slice_max(n = 20, order_by = avg_log2FC)
+
+# Heatmap of top markers
+DoHeatmap(filtered_all_seurat, features = top20_markers_res0.3$gene) + NoLegend()
+```
+
+**Decision:** Resolution 0.3 was selected because it separates B cells into their own cluster (cluster 11).
+
+# 4. Cell Type Annotation
+
+```{r annotation}
+# Annotate clusters based on marker gene expression
+Idents(filtered_all_seurat) <- filtered_all_seurat$SCT_snn_res.0.3
+
+filtered_all_seurat <- RenameIdents(
+  filtered_all_seurat,
+  "0" = "Fibroblasts",
+  "1" = "Macrophages",
+  "2" = "Fibroblasts",
+  "3" = "Macrophages",
+  "4" = "VSMCs",
+  "5" = "Macrophages",
+  "6" = "Fibroblasts",
+  "7" = "ECs",
+  "8" = "Macrophages",
+  "9" = "ECs",
+  "10" = "T cells",
+  "11" = "B cells",
+  "12" = "Neutrophils"
+)
+
+# Save annotation to metadata
+filtered_all_seurat@meta.data$annotation <- Idents(filtered_all_seurat)
+
+# Visualize annotated clusters
+DimPlot(filtered_all_seurat, label = TRUE) + NoLegend()
+
+# Find markers for annotated clusters
+Clustermarkers_annotated <- FindAllMarkers(
+  filtered_all_seurat, 
+  assay = "SCT", 
+  only.pos = TRUE, 
+  min.pct = 0.25, 
+  logfc.threshold = 0.25
+)
+
+top30_markers_annotated <- Clustermarkers_annotated %>% 
+  group_by(cluster) %>% 
+  slice_max(n = 20, order_by = avg_log2FC)
+
+# Save marker tables
+write_csv(Clustermarkers_annotated, file.path(results_dir, "Clustermarkers_annotated.csv"))
+write_csv(top30_markers_annotated, file.path(results_dir, "top30_markers_annotated.csv"))
+```
+
+## Visualize Cell Type Markers
+
+```{r marker_visualization}
+# Define canonical markers for each cell type
+Fibroblasts_markers <- c("Col1a1", "Col1a2", "Fbn1", "Pdgfrb")
+Macrophages_markers <- c("Lyz2", "C1qa", "C1qb", "Mrc1")
+VSMC_markers <- c("Acta2", "Tagln", "Myh11")
+EC_markers <- c("Cdh5", "Vwf", "Pecam1", "Tek")
+T_markers <- c("Trbc2", "Cd3g", "Skap1", "Itk")
+B_markers <- c("Igkc", "Bank1", "Bach2", "Cd79a", "Cd79b")
+Neutrophil_markers <- c("S100a9", "S100a8", "Il1b", "Clec4d", "Clec4e")
+
+# Dot plot of all markers
+dot_plot <- DotPlot(
+  filtered_all_seurat, 
+  features = c(Fibroblasts_markers, Macrophages_markers, VSMC_markers, 
+               EC_markers, T_markers, B_markers, Neutrophil_markers)
+) +
+  scale_color_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 13),
+    axis.text.y = element_text(size = 13),
+    panel.grid.major = element_line(color = "grey", linewidth = 0.2),
+    panel.grid.minor = element_blank(),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 1)
+  ) +
+  labs(title = "Cluster Markers Expression", x = "Markers", y = "Cell Type")
+
+print(dot_plot)
+
+# Save annotated object
+qsave(filtered_all_seurat, file.path(results_dir, "filtered_all_annotated.qs"))
+```
+
+## Visualize Doublets
+
+```{r doublet_visualization}
+DimPlot(
+  object = filtered_all_seurat,
+  group.by = "predicted_doublet",
+  cols = c("FALSE" = "skyblue", "TRUE" = "red"),
+  label = TRUE,
+  label.size = 4
+) + ggtitle("UMAP Plot: Doublet Detection")
+```
+
+# 5. Cell Type Subsetting and Recentering
+
+Subset each cell type, recenter, and re-integrate for downstream analyses.
+
+```{r subset_function}
+# Function to subset, recenter, and re-integrate each cell type
+process_cell_type <- function(seurat_obj, cell_type, output_dir, 
+                               resolution = c(0.03, 0.05, 0.1, 0.2, 0.3, 0.4), 
+                               npcs = 50) {
+  # Subset the cell type
+  cell_subset <- subset(seurat_obj, idents = cell_type)
+  
+  # Recenter and repeat integration
+  cell_subset <- cell_subset %>%
+    NormalizeData() %>%
+    FindVariableFeatures(selection.method = "vst", nfeatures = 2000) %>%
+    ScaleData() %>%
+    SCTransform(vst.flavor = "v2") %>%
+    RunPCA(assay = "SCT", npcs = npcs) %>%
+    RunHarmony(group.by.vars = "group", reduction = "pca", 
+               assay.use = "SCT", reduction.save = "harmony") %>%
+    FindNeighbors(reduction = "harmony", dims = 1:npcs) %>%
+    FindClusters(resolution = resolution) %>%
+    RunUMAP(reduction = "harmony", assay = "SCT", dims = 1:npcs)
+  
+  # Save the subsetted Seurat object
+  output_file <- file.path(output_dir, paste0(cell_type, "_processed.qs"))
+  qsave(cell_subset, output_file)
+  
+  return(cell_subset)
+}
+```
+
+```{r run_subsetting, eval=FALSE}
+# Note: This is memory-intensive and was run on HPC
+# Set eval=TRUE if running locally with sufficient memory
+
+cell_types <- c("Fibroblasts", "Macrophages", "VSMCs", "ECs", "T cells", "B cells", "Neutrophils")
+
+for (cell_type in cell_types) {
+  process_cell_type(filtered_all_seurat, cell_type, results_dir)
+}
+
+# Download processed files from HPC:
+# rsync -avzhe ssh user@hpc:/path/to/results/*_processed.qs ./results/
+```
+
+# 6. Cell Composition Analysis
+
+## Calculate Cell Type Ratios
+
+```{r cell_ratios}
+# Remove doublets before calculating ratios
+Idents(filtered_all_seurat) <- filtered_all_seurat$predicted_doublet
+filtered_all_seurat_clean <- subset(filtered_all_seurat, idents = FALSE)
+Idents(filtered_all_seurat_clean) <- filtered_all_seurat_clean$annotation
+
+# Calculate cell counts per group and cell type
+numCells_all <- as.data.frame.matrix(
+  table(filtered_all_seurat_clean$group, filtered_all_seurat_clean$annotation)
+)
+numCells_all$total <- rowSums(numCells_all)
+numCells_all <- rownames_to_column(numCells_all, var = "group")
+
+# Convert to long format and calculate ratios
+longnumCells_all <- pivot_longer(
+  numCells_all, 
+  cols = -c(group, total), 
+  names_to = "cell_type", 
+  values_to = "count"
+)
+longnumCells_all <- longnumCells_all %>%
+  mutate(cluster.ratio = count / total)
+longnumCells_all$group <- factor(
+  longnumCells_all$group, 
+  levels = c("WT_Week0", "Het_Week0", "WT_Week12", "Het_Week12")
+)
+
+write_csv(longnumCells_all, file.path(results_dir, "longnumCells_all.csv"))
+
+# Plot cell type ratios
+ggplot(longnumCells_all, aes(x = group, y = cluster.ratio, fill = group)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(x = "Group", y = "Cell count / Total cell count", fill = "Group") +
+  theme_minimal() +
+  facet_wrap(~cell_type, scales = "free_y", ncol = 4) +
+  scale_fill_manual(values = group_colors) +
+  mytheme +
+  NoLegend()
+```
+
+## Fisher's Exact Tests for Cell Type Proportions
+
+```{r fisher_tests}
+df <- numCells_all
+
+# Create "non-celltype" columns for Fisher's tests
+df$nonEC <- df$total - df$ECs
+df$nonVSMCs <- df$total - df$VSMCs
+df$nonFibroblasts <- df$total - df$Fibroblasts
+df$nonMacrophages <- df$total - df$Macrophages
+df$nonBcells <- df$total - df$`B cells`
+df$nonTcells <- df$total - df$`T cells`
+df$nonNeutrophils <- df$total - df$Neutrophils
+
+# Het vs WT at Week 0
+p.EC_W0 <- fisher.test(df[c(1, 2), c("ECs", "nonEC")])$p.value
+p.VSMC_W0 <- fisher.test(df[c(1, 2), c("VSMCs", "nonVSMCs")])$p.value
+p.Fibroblasts_W0 <- fisher.test(df[c(1, 2), c("Fibroblasts", "nonFibroblasts")])$p.value
+p.Macrophages_W0 <- fisher.test(df[c(1, 2), c("Macrophages", "nonMacrophages")])$p.value
+p.Neutrophils_W0 <- fisher.test(df[c(1, 2), c("Neutrophils", "nonNeutrophils")])$p.value
+p.Bcells_W0 <- fisher.test(df[c(1, 2), c("B cells", "nonBcells")])$p.value
+p.Tcells_W0 <- fisher.test(df[c(1, 2), c("T cells", "nonTcells")])$p.value
+
+# Het vs WT at Week 12
+p.EC_W12 <- fisher.test(df[c(3, 4), c("ECs", "nonEC")])$p.value
+p.VSMC_W12 <- fisher.test(df[c(3, 4), c("VSMCs", "nonVSMCs")])$p.value
+p.Fibroblasts_W12 <- fisher.test(df[c(3, 4), c("Fibroblasts", "nonFibroblasts")])$p.value
+p.Macrophages_W12 <- fisher.test(df[c(3, 4), c("Macrophages", "nonMacrophages")])$p.value
+p.Neutrophils_W12 <- fisher.test(df[c(3, 4), c("Neutrophils", "nonNeutrophils")])$p.value
+p.Bcells_W12 <- fisher.test(df[c(3, 4), c("B cells", "nonBcells")])$p.value
+p.Tcells_W12 <- fisher.test(df[c(3, 4), c("T cells", "nonTcells")])$p.value
+
+# Combine and adjust p-values
+all_pvalues <- c(
+  p.EC_W0, p.VSMC_W0, p.Fibroblasts_W0, p.Macrophages_W0, 
+  p.Neutrophils_W0, p.Bcells_W0, p.Tcells_W0,
+  p.EC_W12, p.VSMC_W12, p.Fibroblasts_W12, p.Macrophages_W12, 
+  p.Neutrophils_W12, p.Bcells_W12, p.Tcells_W12
+)
+adjusted_pvalues <- p.adjust(all_pvalues, method = "BH")
+
+# Create summary table
+fisher_results <- data.frame(
+  Comparison = rep(c("Het_vs_WT_Week0", "Het_vs_WT_Week12"), each = 7),
+  CellType = rep(c("ECs", "VSMCs", "Fibroblasts", "Macrophages", 
+                   "Neutrophils", "B cells", "T cells"), 2),
+  P_value = all_pvalues,
+  P_adj = adjusted_pvalues
+)
+write_csv(fisher_results, file.path(results_dir, "fisher_test_results.csv"))
+```
+
+# 7. Differential Expression and GSEA
+
+## DEG and GSEA Analysis Function
+
+```{r deg_gsea_function}
+# This function performs DEG analysis and GSEA for each cell type
+# Note: This was run on HPC due to memory requirements
+
+analyze_cell_type <- function(file_path, group1, group2, group3, group4, output_dir) {
+  # Read the Seurat object
+  seurat_obj <- qread(file_path)
+  
+  # Extract cell type from file name
+  cell_type <- sub("_processed", "", tools::file_path_sans_ext(basename(file_path)))
+  
+  # Set Idents to group
+  seurat_obj$annotation <- Idents(seurat_obj)
+  Idents(seurat_obj) <- seurat_obj$group
+  
+  # DE analysis: Het vs WT at Week 0
+  DE_results_Day0 <- FindMarkers(
+    seurat_obj,
+    ident.1 = group1,  # Het_Week0
+    ident.2 = group3,  # WT_Week0
+    min.pct = 0.20,
+    logfc.threshold = 0.10
+  )
+  
+  # DE analysis: Het vs WT at Week 12
+  DE_results_Week12 <- FindMarkers(
+    seurat_obj,
+    ident.1 = group2,  # Het_Week12
+    ident.2 = group4,  # WT_Week12
+    min.pct = 0.20,
+    logfc.threshold = 0.10
+  )
+  
+  # Prepare gene lists for GSEA
+  prepare_gsea_input <- function(de_results) {
+    gene_list <- de_results$avg_log2FC
+    names(gene_list) <- rownames(de_results)
+    gene_list <- sort(gene_list, decreasing = TRUE)
+    return(gene_list)
+  }
+  
+  gene_list_Day0 <- prepare_gsea_input(DE_results_Day0)
+  gene_list_Week12 <- prepare_gsea_input(DE_results_Week12)
+  
+  # Get gene sets
+  m_hallmark <- msigdbr(species = "Mus musculus", category = "H")
+  m_gobp <- msigdbr(species = "Mus musculus", category = "C5", subcategory = "GO:BP")
+  m_gomf <- msigdbr(species = "Mus musculus", category = "C5", subcategory = "GO:MF")
+  m_gocc <- msigdbr(species = "Mus musculus", category = "C5", subcategory = "GO:CC")
+  
+  # Run GSEA for each gene set collection
+  run_gsea <- function(gene_list, term2gene) {
+    GSEA(
+      geneList = gene_list,
+      TERM2GENE = term2gene %>% dplyr::select(gs_name, gene_symbol),
+      minGSSize = 15,
+      maxGSSize = 500,
+      pvalueCutoff = 1,
+      pAdjustMethod = "BH"
+    )
+  }
+  
+  # GSEA for all collections
+  gsea_Hallmark_Day0 <- run_gsea(gene_list_Day0, m_hallmark)
+  gsea_Hallmark_Week12 <- run_gsea(gene_list_Week12, m_hallmark)
+  gsea_GOBP_Day0 <- run_gsea(gene_list_Day0, m_gobp)
+  gsea_GOBP_Week12 <- run_gsea(gene_list_Week12, m_gobp)
+  gsea_GOMF_Day0 <- run_gsea(gene_list_Day0, m_gomf)
+  gsea_GOMF_Week12 <- run_gsea(gene_list_Week12, m_gomf)
+  gsea_GOCC_Day0 <- run_gsea(gene_list_Day0, m_gocc)
+  gsea_GOCC_Week12 <- run_gsea(gene_list_Week12, m_gocc)
+  
+  # Compile results
+  result_list <- list(
+    DE_results_Day0,
+    DE_results_Week12,
+    gsea_Hallmark_Day0,
+    gsea_Hallmark_Week12,
+    gsea_GOBP_Day0,
+    gsea_GOBP_Week12,
+    gsea_GOMF_Day0,
+    gsea_GOMF_Week12,
+    gsea_GOCC_Day0,
+    gsea_GOCC_Week12
+  )
+  
+  names(result_list) <- c(
+    paste0(cell_type, "_DE_Day0CCM2hetvsWT"),
+    paste0(cell_type, "_DE_PCSK9CCM2hetvsWT"),
+    paste0(cell_type, "_GSEA_Hallmark_Day0CCM2hetvsWT"),
+    paste0(cell_type, "_GSEA_Hallmark_PCSK9CCM2hetvsWT"),
+    paste0(cell_type, "_GSEA_GOBP_Day0CCM2hetvsWT"),
+    paste0(cell_type, "_GSEA_GOBP_PCSK9CCM2hetvsWT"),
+    paste0(cell_type, "_GSEA_GOMF_Day0CCM2hetvsWT"),
+    paste0(cell_type, "_GSEA_GOMF_PCSK9CCM2hetvsWT"),
+    paste0(cell_type, "_GSEA_GOCC_Day0CCM2hetvsWT"),
+    paste0(cell_type, "_GSEA_GOCC_PCSK9CCM2hetvsWT")
+  )
+  
+  # Save results
+  output_file <- file.path(output_dir, paste0(cell_type, "_GSEA.qs"))
+  qsave(result_list, output_file)
+  
+  return(result_list)
+}
+```
+
+```{r run_deg_gsea, eval=FALSE}
+# Run on HPC with: Rscript analyze_cell_types.R
+
+qs_files <- list.files(results_dir, pattern = "*_processed.qs", full.names = TRUE)
+
+group1 <- "Het_Week0"
+group2 <- "Het_Week12"
+group3 <- "WT_Week0"
+group4 <- "WT_Week12"
+
+for (file_path in qs_files) {
+  analyze_cell_type(file_path, group1, group2, group3, group4, results_dir)
+}
+
+# Download results:
+# rsync -avzhe ssh user@hpc:/path/to/results/*_GSEA.qs ./results/
+```
+
+## Load GSEA Results
+
+```{r load_gsea}
+ECs_GSEA <- qread(file.path(results_dir, "ECs_GSEA.qs"))
+VSMCs_GSEA <- qread(file.path(results_dir, "VSMCs_GSEA.qs"))
+Macrophages_GSEA <- qread(file.path(results_dir, "Macrophages_GSEA.qs"))
+Fibroblasts_GSEA <- qread(file.path(results_dir, "Fibroblasts_GSEA.qs"))
+Tcells_GSEA <- qread(file.path(results_dir, "T_cells_GSEA.qs"))
+Bcells_GSEA <- qread(file.path(results_dir, "B_cells_GSEA.qs"))
+Neutrophil_GSEA <- qread(file.path(results_dir, "Neutrophils_GSEA.qs"))
+```
+
+# 8. DEG Visualization
+
+## DEG Counts by Cell Type
+
+```{r deg_counts}
+cell_types <- c("ECs", "VSMCs", "Macrophages", "Fibroblasts", "T cells", "B cells", "Neutrophils")
+gsea_lists <- list(ECs_GSEA, VSMCs_GSEA, Macrophages_GSEA, Fibroblasts_GSEA, 
+                   Tcells_GSEA, Bcells_GSEA, Neutrophil_GSEA)
+names(gsea_lists) <- cell_types
+
+# Extract DEG lists
+DEGs_allcluster_list_W0 <- lapply(gsea_lists, function(x) x[[1]])
+DEGs_allcluster_list_W12 <- lapply(gsea_lists, function(x) x[[2]])
+names(DEGs_allcluster_list_W0) <- cell_types
+names(DEGs_allcluster_list_W12) <- cell_types
+
+# Count significant DEGs
+count_degs <- function(deg_list, fc_threshold = 0.2, pval_threshold = 0.05) {
+  deg_list %>% 
+    filter(p_val_adj <= pval_threshold) %>% 
+    filter(abs(avg_log2FC) >= fc_threshold) %>%
+    nrow()
+}
+
+deg_summary <- data.frame(
+  CellType = cell_types,
+  DEGs_Week0 = sapply(DEGs_allcluster_list_W0, count_degs),
+  DEGs_Week12 = sapply(DEGs_allcluster_list_W12, count_degs)
+)
+print(deg_summary)
+```
+
+## DEG Count Bar Plots
+
+```{r deg_barplots}
+# Week 0
+deg_counts_W0 <- imap_dfr(DEGs_allcluster_list_W0, ~{
+  df <- .x
+  cluster <- .y
+  tibble(
+    cluster = cluster,
+    n_up = sum(df$avg_log2FC > 0 & df$p_val_adj <= 0.05),
+    n_down = sum(df$avg_log2FC < 0 & df$p_val_adj <= 0.05)
+  )
+}) %>%
+  mutate(n_down = -n_down) %>%
+  pivot_longer(c(n_up, n_down), names_to = "direction", values_to = "value")
+
+ggplot(deg_counts_W0, aes(x = cluster, y = value, fill = direction)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  scale_fill_manual(
+    values = c(n_up = "indianred", n_down = "steelblue"),
+    labels = c(n_up = "Up (logFC>0)", n_down = "Down (logFC<0)")
+  ) +
+  labs(x = NULL, y = "Number of DEGs (p-adjust ≤ 0.05)", 
+       title = "DEG counts per cell type (Week 0)", fill = "Direction") +
+  theme_bw() +
+  theme(panel.grid = element_blank(), axis.text.y = element_text(size = 12), 
+        legend.position = "top")
+
+# Week 12
+deg_counts_W12 <- imap_dfr(DEGs_allcluster_list_W12, ~{
+  df <- .x
+  cluster <- .y
+  tibble(
+    cluster = cluster,
+    n_up = sum(df$avg_log2FC > 0 & df$p_val_adj <= 0.05),
+    n_down = sum(df$avg_log2FC < 0 & df$p_val_adj <= 0.05)
+  )
+}) %>%
+  mutate(n_down = -n_down) %>%
+  pivot_longer(c(n_up, n_down), names_to = "direction", values_to = "value")
+
+ggplot(deg_counts_W12, aes(x = cluster, y = value, fill = direction)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  scale_fill_manual(
+    values = c(n_up = "indianred", n_down = "steelblue"),
+    labels = c(n_up = "Up (logFC>0)", n_down = "Down (logFC<0)")
+  ) +
+  labs(x = NULL, y = "Number of DEGs (p-adjust ≤ 0.05)", 
+       title = "DEG counts per cell type (Week 12)", fill = "Direction") +
+  theme_bw() +
+  theme(panel.grid = element_blank(), axis.text.y = element_text(size = 12), 
+        legend.position = "top")
+```
+
+# 9. Sanity Checks
+
+## Expression of Key Genes (Ccm2, Klf2, Klf4)
+
+```{r sanity_checks}
+# Sanity check: Ccm2, Klf2, Klf4 expression
+Idents(filtered_all_seurat) <- filtered_all_seurat$group
+
+sanity_W0 <- FindMarkers(
+  filtered_all_seurat, 
+  features = c("Ccm2", "Klf2", "Klf4"), 
+  test.use = "wilcox", 
+  ident.1 = "Het_Week0", 
+  ident.2 = "WT_Week0", 
+  logfc.threshold = 0.01
+)
+
+sanity_W12 <- FindMarkers(
+  filtered_all_seurat, 
+  features = c("Ccm2", "Klf2", "Klf4"), 
+  test.use = "wilcox", 
+  ident.1 = "Het_Week12", 
+  ident.2 = "WT_Week12", 
+  logfc.threshold = 0.01
+)
+
+# Violin plots
+VlnPlot(filtered_all_seurat, idents = c("WT_Week0", "Het_Week0"), 
+        features = c("Ccm2", "Klf2", "Klf4"))
+VlnPlot(filtered_all_seurat, idents = c("WT_Week12", "Het_Week12"), 
+        features = c("Ccm2", "Klf2", "Klf4"))
+
+# Summary statistics
+genes_to_plot <- c("Ccm2", "Klf2", "Klf4", "Nos3", "Aqp1")
+plot_data <- FetchData(filtered_all_seurat, vars = c("ident", genes_to_plot))
+
+plot_data_summary <- plot_data %>%
+  tidyr::pivot_longer(cols = all_of(genes_to_plot), names_to = "Gene", values_to = "Expression") %>%
+  group_by(ident, Gene) %>%
+  summarise(
+    Mean = mean(Expression),
+    SE = sd(Expression) / sqrt(n()),
+    Median = median(Expression),
+    N = n(),
+    .groups = "drop"
+  )
+
+write.csv(plot_data_summary, file.path(results_dir, "scRNAseq_sanity.csv"))
+```
+
+# 10. Pathway Visualization
+
+## GSEA Combination Function
+
+```{r gsea_combination_function}
+gsea_combination <- function(gsea_list, cell_types, list_index) {
+  combined_results <- data.frame()
+  
+  for (i in seq_along(gsea_list)) {
+    result_df <- gsea_list[[i]][[list_index]]@result
+    result_df <- result_df %>% filter(p.adjust < 0.05)
+    
+    if (nrow(result_df) == 0) {
+      result_df <- data.frame(
+        Description = NA, NES = NA, p.adjust = NA, 
+        cell_type = cell_types[i]
+      )
+    } else {
+      result_df$cell_type <- cell_types[i]
+    }
+    
+    combined_results <- bind_rows(combined_results, result_df)
+  }
+  
+  combined_results <- combined_results[, c("Description", "NES", "p.adjust", "cell_type")]
+  combined_results$negLog_padjust <- -log10(combined_results$p.adjust)
+  combined_results <- combined_results %>% filter(!is.na(Description))
+  combined_results <- combined_results %>%
+    mutate(
+      Description = gsub("HALLMARK_", "", Description),
+      Description = gsub("_", " ", Description)
+    )
+  
+  return(combined_results)
+}
+```
+
+## Hallmark Pathways
+
+```{r hallmark_plots}
+gsea_lists <- list(ECs_GSEA, VSMCs_GSEA, Macrophages_GSEA, Fibroblasts_GSEA, 
+                   Tcells_GSEA, Bcells_GSEA, Neutrophil_GSEA)
+cell_types_plot <- c("EC", "VSMC", "Macrophage", "Fibroblasts", "T cells", "B cells", "Neutrophils")
+
+# Week 0 Hallmark
+combined_Hallmark_Week0 <- gsea_combination(gsea_lists, cell_types_plot, list_index = 3)
+write_csv(combined_Hallmark_Week0, file.path(results_dir, "GSEA/combined_Hallmark_Week0.csv"))
+
+ggplot(combined_Hallmark_Week0, aes(x = cell_type, y = Description, 
+                                    size = negLog_padjust, color = NES)) +
+  geom_point() +
+  theme_minimal() +
+  scale_color_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0) +
+  bubbleplot_theme +
+  labs(color = "NES", size = "-log10(p.adjust)", x = "Cell Type", y = "Pathway",
+       title = "Hallmark Pathways - Week 0")
+
+# Week 12 Hallmark
+combined_Hallmark_Week12 <- gsea_combination(gsea_lists, cell_types_plot, list_index = 4)
+write_csv(combined_Hallmark_Week12, file.path(results_dir, "GSEA/combined_Hallmark_Week12.csv"))
+
+ggplot(combined_Hallmark_Week12, aes(x = cell_type, y = Description, 
+                                     size = negLog_padjust, color = NES)) +
+  geom_point() +
+  theme_minimal() +
+  scale_color_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0) +
+  bubbleplot_theme +
+  labs(color = "NES", size = "-log10(p.adjust)", x = "Cell Type", y = "Pathway",
+       title = "Hallmark Pathways - Week 12")
+```
+
+## GO Biological Process
+
+```{r gobp_plots}
+# Week 0 GOBP
+combined_GOBP_Week0 <- gsea_combination(gsea_lists, cell_types_plot, list_index = 5)
+write_csv(combined_GOBP_Week0, file.path(results_dir, "GSEA/combined_GOBP_Week0.csv"))
+
+# Week 12 GOBP
+combined_GOBP_Week12 <- gsea_combination(gsea_lists, cell_types_plot, list_index = 6)
+write_csv(combined_GOBP_Week12, file.path(results_dir, "GSEA/combined_GOBP_Week12.csv"))
+
+# Selected pathways of interest
+Descriptions <- c(
+  "INFLAMMATORY RESPONSE", 
+  "REGULATION OF INFLAMMATORY RESPONSE", 
+  "POSITIVE REGULATION OF INFLAMMATORY RESPONSE", 
+  "LEUKOCYTE CHEMOTAXIS", 
+  "LEUKOCYTE CELL CELL ADHESION", 
+  "I KAPPAB KINASE NF KAPPAB SIGNALING", 
+  "NIK NF KAPPAB SIGNALING"
+)
+
+# Filter and plot
+combined_GOBP_Week0_filtered <- combined_GOBP_Week0 %>% 
+  filter(Description %in% Descriptions)
+
+ggplot(combined_GOBP_Week0_filtered, 
+       aes(x = cell_type, y = factor(Description, levels = Descriptions), 
+           size = negLog_padjust, color = NES)) +
+  geom_point() +
+  theme_minimal() +
+  scale_color_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0) +
+  bubbleplot_theme +
+  labs(color = "NES", size = "-log10(p.adjust)", x = "Cell Type", y = "Pathway",
+       title = "GOBP - Week 0 (Selected Inflammatory Pathways)")
+```
+
+# 11. Heatmaps for Genes of Interest
+
+```{r heatmaps_genes}
+# Genes of interest
+enrichment_genes_NFkB <- c("Tnf", "Tnfrsf1a", "Tnfrsf1b", "Ikbkb", "Ikbkg", 
+                           "Chuk", "Rela", "Relb", "Rel", "Nfkb1", "Nfkb2")
+
+cell_types <- unique(filtered_all_seurat$annotation)
+
+# Build heatmap data for Week 0
+heatmap_df_W0 <- imap_dfr(DEGs_allcluster_list_W0, ~{
+  df <- .x
+  cluster <- .y
+  df %>%
+    rownames_to_column("gene") %>%
+    filter(gene %in% enrichment_genes_NFkB) %>%
+    transmute(
+      cluster = cluster,
+      gene = gene,
+      logFC = avg_log2FC,
+      p_adj = p_val_adj,
+      sig = if_else(p_val_adj < 0.05, "*", "")
+    )
+}) %>%
+  mutate(gene = factor(gene, levels = enrichment_genes_NFkB))
+
+ggplot(heatmap_df_W0, aes(y = cluster, x = gene, fill = logFC)) +
+  geom_tile(color = "grey90") +
+  geom_text(aes(label = sig), size = 5, color = "black") +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0,
+                       name = "logFC\n(Het vs WT)") +
+  labs(x = NULL, y = NULL, title = "logFC in Het vs WT (Week 0)",
+       subtitle = "Asterisk = p.adj < 0.05") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), panel.grid = element_blank())
+
+# Build heatmap data for Week 12
+heatmap_df_W12 <- imap_dfr(DEGs_allcluster_list_W12, ~{
+  df <- .x
+  cluster <- .y
+  df %>%
+    rownames_to_column("gene") %>%
+    filter(gene %in% enrichment_genes_NFkB) %>%
+    transmute(
+      cluster = cluster,
+      gene = gene,
+      logFC = avg_log2FC,
+      p_adj = p_val_adj,
+      sig = if_else(p_val_adj < 0.05, "*", "")
+    )
+}) %>%
+  mutate(gene = factor(gene, levels = enrichment_genes_NFkB))
+
+ggplot(heatmap_df_W12, aes(y = cluster, x = gene, fill = logFC)) +
+  geom_tile(color = "grey90") +
+  geom_text(aes(label = sig), size = 5, color = "black") +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0,
+                       name = "logFC\n(Het vs WT)") +
+  labs(x = NULL, y = NULL, title = "logFC in Het vs WT (Week 12)",
+       subtitle = "Asterisk = p.adj < 0.05") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), panel.grid = element_blank())
+```
+
+# 12. Custom Gene Set Enrichment
+
+```{r custom_geneset}
+# Load custom gene sets
+custom_genesets <- read_csv(file.path(data_dir, "Custom_gene_sets_Mm.csv"))
+
+gene_set_list <- lapply(seq_along(custom_genesets), function(i) {
+  set_name <- names(custom_genesets)[i]
+  genes <- na.omit(custom_genesets[[i]])
+  return(list(set_name = set_name, genes = as.character(genes)))
+})
+names(gene_set_list) <- colnames(custom_genesets)
+
+# Calculate module scores
+module_scores_df <- data.frame(Cell = colnames(filtered_all_seurat))
+
+seurat_obj_all <- filtered_all_seurat
+
+for (gene_set in gene_set_list) {
+  gene_set_name <- gene_set$set_name
+  gene_list <- list(gene_set$genes)
+  
+  seurat_obj_all <- AddModuleScore(
+    object = seurat_obj_all,
+    features = gene_list,
+    name = "temp"
+  )
+  
+  score_column <- seurat_obj_all@meta.data[["temp1"]]
+  module_scores_df[[gene_set_name]] <- score_column
+  seurat_obj_all@meta.data[["temp1"]] <- NULL
+}
+
+seurat_obj_all@meta.data <- cbind(seurat_obj_all@meta.data, module_scores_df[, -1])
+
+# Subset by timepoint
+Idents(seurat_obj_all) <- seurat_obj_all$group
+seurat_obj_all_W0 <- subset(seurat_obj_all, idents = c("Het_Week0", "WT_Week0"))
+seurat_obj_all_W12 <- subset(seurat_obj_all, idents = c("Het_Week12", "WT_Week12"))
+
+qsave(seurat_obj_all, file.path(results_dir, "customized_score_all.qs"))
+```
+
+## Calculate Custom Gene Set Scores
+
+```{r custom_scores_calculation}
+# Week 0 scores
+Idents(seurat_obj_all_W0) <- seurat_obj_all_W0$annotation
+scores_df_W0 <- FetchData(seurat_obj_all_W0, vars = c("annotation", "group", colnames(custom_genesets)))
+
+results_W0 <- list()
+for (gene_set in colnames(custom_genesets)) {
+  for (cell in unique(scores_df_W0$annotation)) {
+    data <- scores_df_W0 %>% filter(annotation == cell)
+    
+    wilcox_test <- wilcox.test(
+      data[[gene_set]][data$group == "Het_Week0"],
+      data[[gene_set]][data$group == "WT_Week0"]
+    )
+    
+    mean_diff <- mean(data[[gene_set]][data$group == "Het_Week0"]) - 
+                 mean(data[[gene_set]][data$group == "WT_Week0"])
+    
+    pooled_sd <- sd(c(data[[gene_set]][data$group == "Het_Week0"], 
+                      data[[gene_set]][data$group == "WT_Week0"]))
+    cohen_d <- mean_diff / pooled_sd
+    
+    results_W0 <- rbind(results_W0, data.frame(
+      cell_type = cell,
+      time_point = "Week0",
+      gene_set = gene_set,
+      p_value = wilcox_test$p.value,
+      mean_diff = mean_diff,
+      cohen_d = cohen_d
+    ))
+  }
+}
+
+results_W0 <- as.data.frame(results_W0)
+results_W0$adjusted_p_value <- p.adjust(results_W0$p_value, method = "BH")
+results_W0$log10_p <- -log10(results_W0$adjusted_p_value)
+write_csv(results_W0, file.path(results_dir, "customized_setscore_W0.csv"))
+```
+
+## Visualize with Waterfall Plots
+
+```{r waterfall_plots}
+results_W0 <- read_csv(file.path(results_dir, "customized_setscore_W0.csv"))
+
+# NFkB signaling
+results_W0_NFKB <- results_W0 %>% 
+  filter(gene_set == "TNFA_NFkB_activation") %>%
+  arrange(cohen_d) %>% 
+  mutate(
+    cell_type = factor(cell_type, levels = cell_type),
+    significance = ifelse(adjusted_p_value < 0.05, "significant", "not significant")
+  )
+
+ggplot(results_W0_NFKB, aes(x = cell_type, y = cohen_d, fill = significance)) +
+  geom_col() +
+  scale_fill_manual(values = c("significant" = "steelblue", "not significant" = "grey70")) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+  theme_minimal() +
+  labs(
+    x = "Cell Type",
+    y = "Cohen's d",
+    title = "Effect Size of NFkB Genes by Cell Type (Week 0)",
+    fill = "Adjusted p-value"
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+# 13. MAGMA Analysis
+
+This section prepares inputs for MAGMA (Multi-marker Analysis of GenoMic Annotation) to test enrichment of DEGs in GWAS signals.
+
+## Prepare DEGs for MAGMA
+
+```{r magma_prep}
+# Mouse to human gene ID conversion
+mapIt <- function(mouseids, horg, morg, orth) {
+  mouseg <- AnnotationDbi::mapIds(morg, mouseids, "ENTREZID", "SYMBOL")
+  mapped <- AnnotationDbi::select(orth, mouseg, "Homo_sapiens", "Mus_musculus")
+  names(mapped) <- c("Mus_egid", "Homo_egid")
+  husymb <- AnnotationDbi::select(horg, as.character(mapped[, 2]), "SYMBOL", "ENTREZID")
+  return(data.frame(
+    Mus_symbol = mouseids,
+    mapped,
+    Homo_symbol = husymb[, 2]
+  ))
+}
+
+# Process DEGs with mapIt
+process_degs_with_mapIt <- function(degs_df, pval_col = "p_val_adj", pval_threshold = 0.05) {
+  degs_df <- degs_df %>% tibble::rownames_to_column(var = "Mm_symbol")
+  
+  filtered_degs <- degs_df %>% filter(!!sym(pval_col) <= pval_threshold)
+  
+  if (nrow(filtered_degs) == 0) {
+    warning("No significant genes found after filtering.")
+    return(NULL)
+  }
+  
+  human_conversion <- mapIt(
+    mouseids = filtered_degs$Mm_symbol,
+    horg = org.Hs.eg.db,
+    morg = org.Mm.eg.db,
+    orth = Orthology.eg.db
+  )
+  
+  filtered_degs <- filtered_degs %>%
+    left_join(human_conversion, by = c("Mm_symbol" = "Mus_symbol")) %>%
+    filter(!is.na(Homo_egid))
+  
+  return(filtered_degs)
+}
+
+# Create list of all DEGs
+degs_list <- list()
+for (gsea_name in c("ECs_GSEA", "VSMCs_GSEA", "Macrophages_GSEA", "Fibroblasts_GSEA",
+                    "Tcells_GSEA", "Bcells_GSEA", "Neutrophil_GSEA")) {
+  gsea_obj <- get(gsea_name)
+  for (df_name in names(gsea_obj)) {
+    if (grepl("^.*_DE_.*$", df_name)) {
+      degs_list[[df_name]] <- gsea_obj[[df_name]]
+    }
+  }
+}
+
+# Generate MAGMA input
+generate_magma_rows_long <- function(degs_list, pval_col = "p_val_adj", pval_threshold = 0.05) {
+  all_rows <- list()
+  for (df_name in names(degs_list)) {
+    processed_degs <- process_degs_with_mapIt(degs_list[[df_name]], pval_col, pval_threshold)
+    if (is.null(processed_degs) || nrow(processed_degs) == 0) next
+    human_ids <- unique(processed_degs$Homo_egid)
+    df_rows <- data.frame(
+      Contrast = df_name,
+      EntrezID = human_ids,
+      stringsAsFactors = FALSE
+    )
+    all_rows[[df_name]] <- df_rows
+  }
+  magma_table <- do.call(rbind, all_rows)
+  return(magma_table)
+}
+
+magma_table <- generate_magma_rows_long(degs_list, pval_col = "p_val_adj", pval_threshold = 0.1)
+write.table(magma_table, file.path(results_dir, "MAGMA/magma_table.txt"), 
+            sep = "\t", row.names = FALSE, col.names = FALSE, quote = FALSE)
+```
+
+**MAGMA commands (run on HPC):**
+
+```bash
+# Example MAGMA command for CAD UKBB analysis
+magma --gene-results /path/to/CAD_UKBB_50kb_pval_g1000_eur.genes.raw \
+      --set-annot results/MAGMA/magma_table.txt \
+      --out results/MAGMA/bycelltype_v_CADKBB_50kb
+```
+
+# 14. Volcano Plots
+
+## Volcano Plot Function
+
+```{r volcano_function}
+process_volcano_data <- function(df, log2fc_threshold = 0.5, pval_threshold = 0.05, 
+                                  top_n_up = 10, top_n_down = 10) {
+  df <- df %>%
+    mutate(
+      p_val_adj = ifelse(p_val_adj == 0, 1e-300, p_val_adj),
+      neg_log10_pval = -log10(p_val_adj),
+      diffexpressed = case_when(
+        avg_log2FC > log2fc_threshold & p_val_adj < pval_threshold ~ "Upregulated",
+        avg_log2FC < -log2fc_threshold & p_val_adj < pval_threshold ~ "Downregulated",
+        TRUE ~ "Not significant"
+      )
+    ) %>%
+    rownames_to_column(var = "gene")
+  
+  top_upregulated <- df %>%
+    filter(p_val_adj < pval_threshold, avg_log2FC > 0) %>%
+    arrange(desc(avg_log2FC)) %>%
+    slice_head(n = top_n_up)
+  
+  top_downregulated <- df %>%
+    filter(p_val_adj < pval_threshold, avg_log2FC < 0) %>%
+    arrange(avg_log2FC) %>%
+    slice_head(n = top_n_down)
+  
+  top_genes <- bind_rows(top_upregulated, top_downregulated) %>% pull(gene)
+  
+  df <- df %>% mutate(delabel = ifelse(gene %in% top_genes, gene, NA))
+  
+  return(df)
+}
+```
+
+## Generate Volcano Plots for All Cell Types
+
+```{r volcano_plots}
+# ECs
+df <- process_volcano_data(ECs_GSEA[[1]], top_n_up = 9, top_n_down = 15)
+ggplot(data = df, aes(x = avg_log2FC, y = neg_log10_pval, color = diffexpressed, label = delabel)) +
+  labs(color = "Expression", x = expression("log"[2]*" Fold Change"),
+       y = expression("-log"[10]*" Adjusted P-value"), title = "Het vs WT Week 0 - ECs") +
+  volcanoplot_theme +
+  geom_text_repel(max.overlaps = 30, size = 3) +
+  coord_cartesian(ylim = c(0, 75), xlim = c(-2.5, 2.5))
+
+df <- process_volcano_data(ECs_GSEA[[2]], top_n_up = 15, top_n_down = 15)
+ggplot(data = df, aes(x = avg_log2FC, y = neg_log10_pval, color = diffexpressed, label = delabel)) +
+  labs(color = "Expression", x = expression("log"[2]*" Fold Change"),
+       y = expression("-log"[10]*" Adjusted P-value"), title = "Het vs WT Week 12 - ECs") +
+  volcanoplot_theme +
+  geom_text_repel(max.overlaps = 30, size = 3) +
+  coord_cartesian(ylim = c(0, 100), xlim = c(-2.5, 2.5))
+
+# VSMCs
+df <- process_volcano_data(VSMCs_GSEA[[1]], top_n_up = 15, top_n_down = 5)
+ggplot(data = df, aes(x = avg_log2FC, y = neg_log10_pval, color = diffexpressed, label = delabel)) +
+  labs(color = "Expression", x = expression("log"[2]*" Fold Change"),
+       y = expression("-log"[10]*" Adjusted P-value"), title = "Het vs WT Week 0 - VSMCs") +
+  volcanoplot_theme +
+  geom_text_repel(max.overlaps = 30, size = 3) +
+  coord_cartesian(ylim = c(0, 150), xlim = c(-5, 5))
+
+# Macrophages
+df <- process_volcano_data(Macrophages_GSEA[[1]])
+ggplot(data = df, aes(x = avg_log2FC, y = neg_log10_pval, color = diffexpressed, label = delabel)) +
+  labs(color = "Expression", x = expression("log"[2]*" Fold Change"),
+       y = expression("-log"[10]*" Adjusted P-value"), title = "Het vs WT Week 0 - Macrophages") +
+  volcanoplot_theme +
+  geom_text_repel(max.overlaps = 30, size = 3) +
+  coord_cartesian(ylim = c(0, 400), xlim = c(-2.5, 2.5))
+
+# Fibroblasts
+df <- process_volcano_data(Fibroblasts_GSEA[[1]])
+ggplot(data = df, aes(x = avg_log2FC, y = neg_log10_pval, color = diffexpressed, label = delabel)) +
+  labs(color = "Expression", x = expression("log"[2]*" Fold Change"),
+       y = expression("-log"[10]*" Adjusted P-value"), title = "Het vs WT Week 0 - Fibroblasts") +
+  volcanoplot_theme +
+  geom_text_repel(max.overlaps = 30, size = 3) +
+  coord_cartesian(ylim = c(0, 120), xlim = c(-2.5, 2.5))
+```
+
+# 15. Session Info
+
+```{r session_info}
+sessionInfo()
+```

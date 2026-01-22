@@ -1,0 +1,12 @@
+TNFA_NFkB_activation,Inflam_thrombogenesis,Senesence,Athero_protective,Athero_prone,ECenrichment_genes_circu,ECenrichment_genes_cytokine,ECenrichment_genes_immuneprocess
+Tnf,Ccl2,Sqstm1,Klf2,Pdgfb,Nfatc1,IL6RA,IRAK2
+Tnfrsf1a,Ccl4,Map1lc3b,Nos3,Edn1,Vegfa,STAT3,ECM1
+Tnfrsf1b,Sell,Mertk,Plpp3,Ccl2,Ephb4,TNF,PRKCB
+Ikbkb,Selp,Trp53,Tnxb,Sele,Flt1,CXCL10,VEGFA
+Ikbkg,Sele,Cdkn1a,Thbd,Col4a1,Tie1,CCL2,PIK3R1
+Chuk,Icam1,Cdkn2a,,Col4a2,Foxc2,CCR5,NFE2L2
+Rela,Vcam1,,,,Ets1,CCR1,ERBIN
+Relb,Bcl2,,,,Gata3,IL10,ZFP36
+Rel,Bax,,,,Bmp2,IL1R1,RIPK1
+Nfkb1,Ptpn3,,,,Pik3cb,JAK2,DNAJB9
+Nfkb2,,,,,,,
