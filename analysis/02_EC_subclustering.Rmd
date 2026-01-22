@@ -1,0 +1,886 @@
+---
+title: "CCM2 Het KO Mice Aorta scRNA-seq: Endothelial Cell Subclustering"
+author: "Shi Fang"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Overview
+
+This analysis focuses on endothelial cell (EC) subclustering from scRNA-seq data of aortic tissue from CCM2 heterozygous knockout mice.
+
+**Prerequisites:** This script requires outputs from `01_clustering_annotation.Rmd`, specifically:
+- `ECs_processed.qs` (EC subset, recentered and reclustered)
+
+## EC Subtype Summary
+
+| Cluster | Annotation | Description | Key Markers |
+| 0 | EC1.1 | Arterial EC | Cytl1, Clu, Pecam1, Icam2 |
+| 1 | EC1.2 | Inflammatory EC | C1qa, C1qb, C1qc, Ccl4 |
+| 2 | EC1.3 | Mesenchymal-like EC | Dcn, Serpine1, Timp1, Fn1 |
+| 3 | EC2 | Capillary EC | Fabp4, Cd36, Gpihbp1, Rbp7, Lpl |
+| 4 | EC3 | Lymphatic EC | Lyve1, Flt4, Prox1 |
+
+# Setup
+
+## Load Libraries
+
+```{r load_libraries}
+# Core packages
+library(Seurat)
+library(harmony)
+library(qs)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(stringr)
+library(ggplot2)
+library(ggrepel)
+library(purrr)
+library(readr)
+library(reshape2)
+
+# Gene set analysis
+library(msigdbr)
+library(clusterProfiler)
+
+# File output
+library(writexl)
+```
+
+## Define Themes and Color Palettes
+
+```{r define_themes}
+# Group colors for consistent plotting
+group_colors <- c(
+  "WT_Week0" = "blue",
+  "Het_Week0" = "green3", 
+  "WT_Week12" = "red", 
+  "Het_Week12" = "orange"
+)
+
+# EC subcluster order
+ec_subtypes <- c("EC1.1", "EC1.2", "EC1.3", "EC2", "EC3")
+
+# Theme for heatmaps
+mytheme <- theme_classic() + 
+  theme(
+    axis.text = element_text(size = 10, face = "bold"),
+    axis.title = element_text(size = 8),
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 10),
+    axis.line = element_line(color = "black", size = 0.25),
+    axis.ticks = element_line(color = "black", size = 0.25),
+    legend.key.size = unit(10, units = "pt"),
+    legend.text = element_text(size = 7),
+    legend.title = element_text(size = 8)
+  )
+
+# Theme for bubble plots
+bubbleplot_theme <- theme(
+  axis.text.x = element_text(angle = 45, hjust = 1, size = 13),
+  axis.text.y = element_text(size = 13),
+  panel.grid.major = element_line(color = "grey", linewidth = 0.2),
+  panel.grid.minor = element_blank(),
+  panel.border = element_rect(color = "black", fill = NA, linewidth = 1)
+)
+
+# Theme for cluster ratio plots
+clusterratio_theme <- theme(
+  axis.text = element_text(size = 10, face = "bold"),
+  axis.title = element_text(size = 10, face = "bold"),
+  plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+  axis.line = element_line(color = "black", size = 0.25),
+  axis.ticks = element_line(color = "black", size = 0.25),
+  legend.key.size = unit(10, units = "pt"),
+  legend.text = element_text(size = 7),
+  legend.title = element_text(size = 8)
+)
+```
+
+## Set Paths
+
+```{r set_paths}
+# Input/output directories
+data_dir <- "data/"
+results_dir <- "results/"
+figures_dir <- "figures/"
+
+# Create directories if needed
+dir.create(file.path(results_dir, "EC_analysis"), showWarnings = FALSE, recursive = TRUE)
+```
+
+# 1. Load EC Subset
+
+```{r load_ec_data}
+# Load processed EC subset from 01_clustering_annotation.Rmd
+EC <- qread(file.path(results_dir, "ECs_processed.qs"))
+
+# Add annotation to metadata
+EC@meta.data$annotation <- "ECs"
+
+# Check for doublets
+n_doublets <- nrow(EC@meta.data %>% filter(predicted_doublet == TRUE))
+cat("Number of doublets in EC subset:", n_doublets, "\n")
+
+# Remove doublets
+EC <- subset(EC, subset = predicted_doublet == FALSE)
+cat("Cells after doublet removal:", ncol(EC), "\n")
+
+DimPlot(EC, label = TRUE)
+```
+
+## Sanity Check: Key Gene Expression
+
+```{r sanity_check}
+Idents(EC) <- EC@meta.data$group
+
+# Ccm2, Klf2, Klf4 expression - Het vs WT
+sanity_EC_W0 <- FindMarkers(
+  EC, 
+  features = c("Ccm2", "Klf2", "Klf4"), 
+  test.use = "wilcox", 
+  ident.1 = "Het_Week0", 
+  ident.2 = "WT_Week0", 
+  logfc.threshold = 0.01
+)
+print("Week 0 Het vs WT:")
+print(sanity_EC_W0)
+
+sanity_EC_W12 <- FindMarkers(
+  EC, 
+  features = c("Ccm2", "Klf2", "Klf4"), 
+  test.use = "wilcox", 
+  ident.1 = "Het_Week12", 
+  ident.2 = "WT_Week12", 
+  logfc.threshold = 0.01
+)
+print("Week 12 Het vs WT:")
+print(sanity_EC_W12)
+```
+
+# 2. EC Subclustering and Annotation
+
+```{r ec_subclustering}
+# Use resolution 0.1 for subclustering (5 well-separated clusters)
+Idents(EC) <- EC@meta.data$SCT_snn_res.0.1
+
+DimPlot(EC, label = TRUE) + ggtitle("EC Subclusters (res 0.1)")
+DimPlot(EC, group.by = "group", label = TRUE) + ggtitle("EC by Group")
+
+# Find cluster markers
+Clustermarkers_EC_res0.1 <- FindAllMarkers(
+  EC, 
+  assay = "SCT", 
+  only.pos = TRUE, 
+  min.pct = 0.25, 
+  logfc.threshold = 0.25
+)
+
+top20_EC_res0.1 <- Clustermarkers_EC_res0.1 %>% 
+  group_by(cluster) %>% 
+  slice_max(n = 20, order_by = avg_log2FC)
+
+DoHeatmap(EC, features = top20_EC_res0.1$gene) + NoLegend()
+
+write_csv(top20_EC_res0.1, file.path(results_dir, "EC_analysis/top20_EC_markers_res0.1.csv"))
+```
+
+## Validate with Published Markers
+
+```{r validate_markers}
+# Reference markers from PMID: 31146585
+Raj_EC1_markers <- c("Clu", "Htra1", "Bmx", "Vcam1", "Eln", "Cytl1", 
+                     "Cfh", "Ace", "Fam3c", "Mt2", "Mgp", "Pam")
+Raj_EC2_markers <- c("Lpl", "Cd36", "Fabp4", "Kdr", "Flt1")
+Raj_EC3_markers <- c("Prox1", "Lyve1", "Flt4", "Reln", "Plvap", "Nsg1")
+
+FeaturePlot(EC, features = Raj_EC1_markers[1:6], min.cutoff = "q10", label = TRUE)
+FeaturePlot(EC, features = Raj_EC2_markers, min.cutoff = "q10", label = TRUE)
+FeaturePlot(EC, features = Raj_EC3_markers[1:4], min.cutoff = "q10", label = TRUE)
+
+# Reference markers from TQ (PMID:38152886)
+C0_markers <- c("Cd36", "Gpihbp1", "Scarb1", "Lpl", "Fabp4", "Kdr")
+C1_markers <- c("Col8a1", "Fbln5", "Fn1", "Col5a2", "Smoc1", "Mmp2")
+C2_markers <- c("Ptprj", "Bmx", "Emp2", "Gja5", "Pecam1", "Ehd4")
+C3_markers <- c("Lyve1", "Prox1", "Flt4", "Nr2f2")
+```
+
+## Annotate EC Subclusters
+
+```{r annotate_ec}
+EC <- RenameIdents(
+  EC,
+  "0" = "EC1.1",
+  "1" = "EC1.2",
+  "2" = "EC1.3",
+  "3" = "EC2",
+  "4" = "EC3"
+)
+
+EC@meta.data$subcluster_annotation <- Idents(EC)
+
+# Define subcluster markers
+EC1.1_markers <- c("Cytl1", "Clu", "Pecam1", "Icam2")
+EC1.2_markers <- c("C1qa", "C1qb", "C1qc", "Ccl4")
+EC1.3_markers <- c("Dcn", "Serpine1", "Timp1", "Fn1")
+EC2_markers <- c("Fabp4", "Cd36", "Gpihbp1", "Rbp7", "Lpl")
+EC3_markers <- c("Lyve1", "Flt4", "Prox1")
+
+# Dot plot of subcluster markers
+DotPlot(EC, features = c(EC1.1_markers, EC1.2_markers, EC1.3_markers, 
+                         EC2_markers, EC3_markers)) +
+  scale_color_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0) +
+  theme_minimal() +
+  bubbleplot_theme +
+  labs(title = "EC Subcluster Markers", x = "Markers", y = "Subcluster")
+
+# Violin plots for key markers
+VlnPlot(EC, features = c("Cytl1", "Clu", "Pecam1"))
+VlnPlot(EC, features = c("Fabp4", "Cd36", "Gpihbp1"))
+VlnPlot(EC, features = c("Lyve1", "Prox1", "Flt4"))
+
+# Save annotated object
+qsave(EC, file.path(results_dir, "EC_annotated.qs"))
+```
+
+# 3. EC Subcluster Composition Analysis
+
+## Calculate Subcluster Ratios
+
+```{r ec_ratios}
+# Calculate cell counts per group and subcluster
+numCells_EC <- as.data.frame.matrix(table(EC$group, EC$subcluster_annotation))
+numCells_EC$total_ECs <- rowSums(numCells_EC)
+numCells_EC <- rownames_to_column(numCells_EC, var = "group")
+
+# Convert to long format
+longnumCells_EC <- pivot_longer(
+  numCells_EC, 
+  cols = -c(group, total_ECs), 
+  names_to = "cell_type", 
+  values_to = "count"
+)
+longnumCells_EC <- longnumCells_EC %>%
+  mutate(cluster.ratio = count / total_ECs)
+longnumCells_EC$group <- factor(
+  longnumCells_EC$group, 
+  levels = c("WT_Week0", "Het_Week0", "WT_Week12", "Het_Week12")
+)
+
+write_csv(longnumCells_EC, file.path(results_dir, "EC_analysis/longnumCells_EC.csv"))
+
+# Plot subcluster ratios
+ggplot(longnumCells_EC, aes(x = group, y = cluster.ratio, fill = group)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(x = "Group", y = "Subcluster / Total ECs", fill = "Group") +
+  theme_minimal() +
+  facet_wrap(~cell_type, scales = "free_y", ncol = 3) +
+  scale_fill_manual(values = group_colors) +
+  clusterratio_theme +
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())
+```
+
+## Subcluster Fraction Comparison
+
+```{r fraction_comparison}
+cell_types <- ec_subtypes
+
+# Week 0
+ratio_df_W0 <- longnumCells_EC %>%
+  filter(group %in% c("WT_Week0", "Het_Week0")) %>%
+  mutate(
+    genotype = if_else(str_detect(group, "^Het"), "Het", "WT"),
+    cell_type = factor(cell_type, levels = cell_types),
+    ratio = cluster.ratio
+  )
+
+ggplot(ratio_df_W0, aes(y = cell_type, x = ratio, fill = genotype)) +
+  geom_col(position = position_dodge(width = 0.75), width = 0.6) +
+  scale_fill_manual(values = c(WT = "#A0A0A0", Het = "#E41A1C")) +
+  labs(y = NULL, x = "Fraction of total ECs", 
+       title = "EC Subcluster Fractions (Week 0)", fill = "Genotype") +
+  theme_bw() +
+  theme(panel.grid = element_blank(), axis.text.y = element_text(size = 12),
+        legend.position = "top")
+
+# Week 12
+ratio_df_W12 <- longnumCells_EC %>%
+  filter(group %in% c("WT_Week12", "Het_Week12")) %>%
+  mutate(
+    genotype = if_else(str_detect(group, "^Het"), "Het", "WT"),
+    cell_type = factor(cell_type, levels = cell_types),
+    ratio = cluster.ratio
+  )
+
+ggplot(ratio_df_W12, aes(y = cell_type, x = ratio, fill = genotype)) +
+  geom_col(position = position_dodge(width = 0.75), width = 0.6) +
+  scale_fill_manual(values = c(WT = "#A0A0A0", Het = "#E41A1C")) +
+  labs(y = NULL, x = "Fraction of total ECs", 
+       title = "EC Subcluster Fractions (Week 12)", fill = "Genotype") +
+  theme_bw() +
+  theme(panel.grid = element_blank(), axis.text.y = element_text(size = 12),
+        legend.position = "top")
+```
+
+## Fisher's Exact Tests
+
+```{r fisher_tests_ec}
+df <- numCells_EC
+
+# Create non-subcluster columns
+for (subtype in ec_subtypes) {
+  df[[paste0("non", subtype)]] <- df$total_ECs - df[[subtype]]
+}
+
+# Week 0: Het vs WT
+fisher_results_W0 <- sapply(ec_subtypes, function(subtype) {
+  non_col <- paste0("non", subtype)
+  fisher.test(df[c(1, 2), c(subtype, non_col)])$p.value
+})
+
+# Week 12: Het vs WT  
+fisher_results_W12 <- sapply(ec_subtypes, function(subtype) {
+  non_col <- paste0("non", subtype)
+  fisher.test(df[c(3, 4), c(subtype, non_col)])$p.value
+})
+
+# Combine and adjust
+fisher_ec_results <- data.frame(
+  Subcluster = rep(ec_subtypes, 2),
+  Timepoint = rep(c("Week0", "Week12"), each = 5),
+  P_value = c(fisher_results_W0, fisher_results_W12)
+)
+fisher_ec_results$P_adj <- p.adjust(fisher_ec_results$P_value, method = "BH")
+
+print(fisher_ec_results)
+write_csv(fisher_ec_results, file.path(results_dir, "EC_analysis/fisher_test_EC_subclusters.csv"))
+```
+
+# 4. Differential Expression Analysis
+
+## Load GSEA Results
+
+```{r load_gsea}
+# Load pre-computed GSEA results (run on HPC with min.pct=0.2, logFC=0.2)
+EC1.1_GSEA <- qread(file.path(results_dir, "EC1.1_logFC0.2_GSEA.qs"))
+EC1.2_GSEA <- qread(file.path(results_dir, "EC1.2_logFC0.2_GSEA.qs"))
+EC1.3_GSEA <- qread(file.path(results_dir, "EC1.3_logFC0.2_GSEA.qs"))
+EC2_GSEA <- qread(file.path(results_dir, "EC2_logFC0.2_GSEA.qs"))
+EC3_GSEA <- qread(file.path(results_dir, "EC3_logFC0.2_GSEA.qs"))
+allECs_GSEA <- qread(file.path(results_dir, "ECs_logFC0.2_GSEA.qs"))
+
+gsea_lists <- list(allECs_GSEA, EC1.1_GSEA, EC1.2_GSEA, EC1.3_GSEA, EC2_GSEA, EC3_GSEA)
+cell_types_gsea <- c("allECs", "EC1.1", "EC1.2", "EC1.3", "EC2", "EC3")
+names(gsea_lists) <- cell_types_gsea
+
+# Extract DEG lists
+DEGs_ECsub_list_W0 <- lapply(gsea_lists, function(x) x[[1]])
+DEGs_ECsub_list_W12 <- lapply(gsea_lists, function(x) x[[2]])
+names(DEGs_ECsub_list_W0) <- cell_types_gsea
+names(DEGs_ECsub_list_W12) <- cell_types_gsea
+```
+
+## DEG Count Visualization
+
+```{r deg_counts}
+# Function to create DEG count plot
+plot_deg_counts <- function(deg_list, title) {
+  deg_counts <- imap_dfr(deg_list, ~{
+    df <- .x
+    cluster <- .y
+    tibble(
+      cluster = cluster,
+      n_up = sum(df$avg_log2FC > 0 & df$p_val_adj <= 0.05),
+      n_down = sum(df$avg_log2FC < 0 & df$p_val_adj <= 0.05)
+    )
+  }) %>%
+    mutate(n_down = -n_down) %>%
+    pivot_longer(c(n_up, n_down), names_to = "direction", values_to = "value")
+  
+  ggplot(deg_counts, aes(x = cluster, y = value, fill = direction)) +
+    geom_bar(stat = "identity") +
+    coord_flip() +
+    scale_fill_manual(
+      values = c(n_up = "indianred", n_down = "steelblue"),
+      labels = c(n_up = "Up (logFC>0)", n_down = "Down (logFC<0)")
+    ) +
+    labs(x = NULL, y = "Number of DEGs (p-adjust ≤ 0.05)", 
+         title = title, fill = "Direction") +
+    theme_bw() +
+    theme(panel.grid = element_blank(), axis.text.y = element_text(size = 12),
+          legend.position = "top")
+}
+
+# Plot for EC subclusters only (exclude allECs)
+plot_deg_counts(DEGs_ECsub_list_W0[ec_subtypes], "DEG counts per EC subcluster (Week 0)")
+plot_deg_counts(DEGs_ECsub_list_W12[ec_subtypes], "DEG counts per EC subcluster (Week 12)")
+```
+
+# 5. GSEA Analysis
+
+## GSEA Combination Function
+
+```{r gsea_functions}
+gsea_combination <- function(gsea_list, cell_types, list_index) {
+  combined_results <- data.frame()
+  
+  for (i in seq_along(gsea_list)) {
+    result_df <- gsea_list[[i]][[list_index]]@result
+    result_df$cell_type <- cell_types[i]
+    result_df <- result_df %>% filter(p.adjust < 0.05)
+    
+    if (nrow(result_df) == 0) {
+      result_df <- data.frame(
+        Description = NA, NES = NA, p.adjust = NA, cell_type = cell_types[i]
+      )
+    }
+    combined_results <- bind_rows(combined_results, result_df)
+  }
+  
+  combined_results <- combined_results[, c("Description", "NES", "p.adjust", "cell_type")]
+  combined_results$negLog_padjust <- -log10(combined_results$p.adjust)
+  combined_results <- combined_results %>% filter(!is.na(Description))
+  combined_results <- combined_results %>%
+    mutate(
+      Description = gsub("HALLMARK_", "", Description),
+      Description = gsub("_", " ", Description)
+    )
+  
+  return(combined_results)
+}
+
+# Version that includes core enrichment genes
+gsea_combination_genes <- function(gsea_list, cell_types, list_index) {
+  combined_results <- data.frame()
+  
+  for (i in seq_along(gsea_list)) {
+    result_df <- gsea_list[[i]][[list_index]]@result
+    result_df$cell_type <- cell_types[i]
+    result_df <- result_df %>% filter(p.adjust < 0.05)
+    
+    if (nrow(result_df) == 0) {
+      result_df <- data.frame(
+        Description = NA, NES = NA, p.adjust = NA, 
+        core_enrichment = NA, cell_type = cell_types[i]
+      )
+    }
+    combined_results <- bind_rows(combined_results, result_df)
+  }
+  
+  combined_results <- combined_results[, c("Description", "NES", "p.adjust", 
+                                           "cell_type", "core_enrichment")]
+  combined_results$negLog_padjust <- -log10(combined_results$p.adjust)
+  combined_results <- combined_results %>% filter(!is.na(Description))
+  combined_results <- combined_results %>%
+    mutate(
+      Description = gsub("HALLMARK_", "", Description),
+      Description = gsub("_", " ", Description)
+    )
+  
+  return(combined_results)
+}
+```
+
+## Hallmark Pathways
+
+```{r hallmark_ec}
+# Week 0
+combined_ECHallmark_Week0 <- gsea_combination(gsea_lists, cell_types_gsea, list_index = 3)
+
+ggplot(combined_ECHallmark_Week0, aes(x = cell_type, y = Description, 
+                                      size = negLog_padjust, color = NES)) +
+  geom_point() +
+  theme_minimal() +
+  scale_color_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0) +
+  bubbleplot_theme +
+  labs(color = "NES", size = "-log10(p.adjust)", x = "EC Subcluster", y = "Pathway",
+       title = "Hallmark Pathways - EC Subclusters (Week 0)")
+
+# Week 12
+combined_ECHallmark_Week12 <- gsea_combination(gsea_lists, cell_types_gsea, list_index = 4)
+
+ggplot(combined_ECHallmark_Week12, aes(x = cell_type, y = Description, 
+                                       size = negLog_padjust, color = NES)) +
+  geom_point() +
+  theme_minimal() +
+  scale_color_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0) +
+  bubbleplot_theme +
+  labs(color = "NES", size = "-log10(p.adjust)", x = "EC Subcluster", y = "Pathway",
+       title = "Hallmark Pathways - EC Subclusters (Week 12)")
+```
+
+## GO Biological Process
+
+```{r gobp_ec}
+# Week 0
+combined_ECGOBP_Week0 <- gsea_combination(gsea_lists, cell_types_gsea, list_index = 5)
+combined_ECGOBP_Week0$Description <- str_remove(combined_ECGOBP_Week0$Description, "^GOBP ")
+
+write_csv(combined_ECGOBP_Week0, file.path(results_dir, "EC_analysis/combined_ECGOBP_Week0.csv"))
+
+# Selected pathways of interest
+Descriptions <- c(
+  "REGULATION OF IMMUNE SYSTEM PROCESS", 
+  "RESPONSE TO CYTOKINE", 
+  "CYTOKINE PRODUCTION", 
+  "CYTOKINE MEDIATED SIGNALING PATHWAY", 
+  "RESPONSE TO CHEMOKINE", 
+  "CIRCULATORY SYSTEM DEVELOPMENT"
+)
+
+combined_ECGOBP_Week0_filtered <- combined_ECGOBP_Week0 %>% 
+  filter(Description %in% Descriptions)
+
+ggplot(combined_ECGOBP_Week0_filtered, 
+       aes(x = cell_type, y = factor(Description, levels = Descriptions), 
+           size = negLog_padjust, color = NES)) +
+  geom_point() +
+  theme_minimal() +
+  scale_color_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0) +
+  bubbleplot_theme +
+  labs(color = "NES", size = "-log10(p.adjust)", x = NULL, y = NULL,
+       title = "Selected GOBP - Week 0") +
+  scale_size_continuous(limits = c(1, 10), range = c(3, 10))
+
+# Week 12
+combined_ECGOBP_Week12 <- gsea_combination(gsea_lists, cell_types_gsea, list_index = 6)
+combined_ECGOBP_Week12$Description <- str_remove(combined_ECGOBP_Week12$Description, "^GOBP ")
+
+write_csv(combined_ECGOBP_Week12, file.path(results_dir, "EC_analysis/combined_ECGOBP_Week12.csv"))
+
+combined_ECGOBP_Week12_filtered <- combined_ECGOBP_Week12 %>% 
+  filter(Description %in% Descriptions)
+
+ggplot(combined_ECGOBP_Week12_filtered, 
+       aes(x = cell_type, y = factor(Description, levels = Descriptions), 
+           size = negLog_padjust, color = NES)) +
+  geom_point() +
+  theme_minimal() +
+  scale_color_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0) +
+  bubbleplot_theme +
+  labs(color = "NES", size = "-log10(p.adjust)", x = NULL, y = NULL,
+       title = "Selected GOBP - Week 12") +
+  scale_size_continuous(limits = c(1, 10), range = c(2, 10))
+```
+
+# 6. Heatmaps for Genes of Interest
+
+```{r heatmaps_ec}
+# Define genes of interest
+genes_of_interest <- c(
+  "Stat3", "Tnf", "Cxcl10", "Ccl2", "Ccr5", "Ccr1", "Il10", "Il1r1", "Jak2",
+  "Irak2", "Vegfa", "Ripk1", "Foxc2", "Ets1", "Gata3", "Bmp2"
+)
+genes_of_interest <- unique(genes_of_interest)
+
+# Function to create heatmap data
+create_heatmap_df <- function(deg_list, genes, subtypes) {
+  imap_dfr(deg_list[subtypes], ~{
+    df <- .x
+    cluster <- .y
+    df %>%
+      rownames_to_column("gene") %>%
+      filter(gene %in% genes) %>%
+      transmute(
+        cluster = cluster,
+        gene = gene,
+        logFC = avg_log2FC,
+        p_adj = p_val_adj,
+        sig = if_else(p_val_adj < 0.05, "*", "")
+      )
+  }) %>%
+    mutate(
+      cluster = factor(cluster, levels = subtypes),
+      gene = factor(gene, levels = genes)
+    )
+}
+
+# Week 0
+heatmap_df_W0 <- create_heatmap_df(DEGs_ECsub_list_W0, genes_of_interest, ec_subtypes)
+
+ggplot(heatmap_df_W0, aes(y = cluster, x = gene, fill = logFC)) +
+  geom_tile(color = "grey90") +
+  geom_text(aes(label = sig), size = 5, color = "black") +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0,
+                       name = "logFC\n(Het vs WT)") +
+  labs(x = NULL, y = NULL, title = "logFC in Het vs WT (Week 0)",
+       subtitle = "Asterisk = p.adj < 0.05") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), panel.grid = element_blank())
+
+# Week 12
+heatmap_df_W12 <- create_heatmap_df(DEGs_ECsub_list_W12, genes_of_interest, ec_subtypes)
+
+ggplot(heatmap_df_W12, aes(y = cluster, x = gene, fill = logFC)) +
+  geom_tile(color = "grey90") +
+  geom_text(aes(label = sig), size = 5, color = "black") +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0,
+                       name = "logFC\n(Het vs WT)") +
+  labs(x = NULL, y = NULL, title = "logFC in Het vs WT (Week 12)",
+       subtitle = "Asterisk = p.adj < 0.05") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), panel.grid = element_blank())
+```
+
+# 7. Custom Gene Set Scoring
+
+## Calculate Module Scores
+
+```{r module_scores}
+# Load custom gene sets
+custom_genesets <- read_csv(file.path(data_dir, "Custom_gene_sets_Mm.csv"))
+
+gene_set_list <- lapply(seq_along(custom_genesets), function(i) {
+  set_name <- names(custom_genesets)[i]
+  genes <- na.omit(custom_genesets[[i]])
+  return(list(set_name = set_name, genes = as.character(genes)))
+})
+names(gene_set_list) <- colnames(custom_genesets)
+
+# Calculate module scores for each gene set
+module_scores_df <- data.frame(Cell = colnames(EC))
+seurat_obj <- EC
+
+for (gene_set in gene_set_list) {
+  gene_set_name <- gene_set$set_name
+  gene_list <- list(gene_set$genes)
+  
+  seurat_obj <- AddModuleScore(
+    object = seurat_obj,
+    features = gene_list,
+    name = "temp"
+  )
+  
+  score_column <- seurat_obj@meta.data[["temp1"]]
+  module_scores_df[[gene_set_name]] <- score_column
+  seurat_obj@meta.data[["temp1"]] <- NULL
+}
+
+seurat_obj@meta.data <- cbind(seurat_obj@meta.data, module_scores_df[, -1])
+
+# Subset by timepoint
+Idents(seurat_obj) <- seurat_obj$group
+seurat_obj_ECs_W0 <- subset(seurat_obj, idents = c("Het_Week0", "WT_Week0"))
+seurat_obj_ECs_W12 <- subset(seurat_obj, idents = c("Het_Week12", "WT_Week12"))
+
+qsave(seurat_obj, file.path(results_dir, "EC_analysis/customized_score_EC.qs"))
+```
+
+## Calculate Scores by Subcluster
+
+```{r scores_by_subcluster}
+# Function to calculate scores
+calculate_subcluster_scores <- function(seurat_obj, genesets, timepoint, group_het, group_wt) {
+  Idents(seurat_obj) <- seurat_obj$subcluster_annotation
+  scores_df <- FetchData(seurat_obj, vars = c("subcluster_annotation", "group", colnames(genesets)))
+  
+  results <- list()
+  for (gene_set in colnames(genesets)) {
+    for (cell in unique(scores_df$subcluster_annotation)) {
+      data <- scores_df %>% filter(subcluster_annotation == cell)
+      
+      wilcox_test <- wilcox.test(
+        data[[gene_set]][data$group == group_het],
+        data[[gene_set]][data$group == group_wt]
+      )
+      
+      mean_diff <- mean(data[[gene_set]][data$group == group_het]) - 
+                   mean(data[[gene_set]][data$group == group_wt])
+      
+      pooled_sd <- sd(c(data[[gene_set]][data$group == group_het], 
+                        data[[gene_set]][data$group == group_wt]))
+      cohen_d <- mean_diff / pooled_sd
+      
+      results <- rbind(results, data.frame(
+        cell_type = cell,
+        time_point = timepoint,
+        gene_set = gene_set,
+        p_value = wilcox_test$p.value,
+        mean_diff = mean_diff,
+        cohen_d = cohen_d
+      ))
+    }
+  }
+  
+  results <- as.data.frame(results)
+  results$adjusted_p_value <- p.adjust(results$p_value, method = "BH")
+  results$log10_p <- -log10(results$adjusted_p_value)
+  
+  return(results)
+}
+
+# Week 0
+results_ECs_W0 <- calculate_subcluster_scores(
+  seurat_obj_ECs_W0, custom_genesets, "Week0", "Het_Week0", "WT_Week0"
+)
+write_csv(results_ECs_W0, file.path(results_dir, "EC_analysis/customized_setscore_ECs_W0.csv"))
+
+# Week 12
+results_ECs_W12 <- calculate_subcluster_scores(
+  seurat_obj_ECs_W12, custom_genesets, "Week12", "Het_Week12", "WT_Week12"
+)
+write_csv(results_ECs_W12, file.path(results_dir, "EC_analysis/customized_setscore_ECs_W12.csv"))
+```
+
+## Waterfall Plots
+
+```{r waterfall_function}
+# Function to create waterfall plot
+plot_waterfall <- function(results, gene_set_name, title, cell_types = ec_subtypes) {
+  plot_data <- results %>% 
+    filter(gene_set == gene_set_name) %>%
+    arrange(cohen_d) %>% 
+    mutate(
+      cell_type = factor(cell_type, levels = cell_type),
+      significance = case_when(
+        adjusted_p_value < 0.05 & cohen_d > 0 ~ "pos_sig",
+        adjusted_p_value < 0.05 & cohen_d < 0 ~ "neg_sig",
+        TRUE ~ "not_sig"
+      )
+    )
+  
+  ggplot(plot_data, aes(x = cohen_d, y = cell_type, fill = significance)) +
+    geom_col(width = 0.6) +
+    scale_fill_manual(
+      values = c(pos_sig = "indianred", not_sig = "grey70", neg_sig = "steelblue"),
+      labels = c(pos_sig = "Significantly increased", 
+                 neg_sig = "Significantly decreased", 
+                 not_sig = "Not significant")
+    ) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "black") +
+    theme_bw() +
+    labs(x = "Cohen's d", y = NULL, title = title, fill = NULL) +
+    theme(axis.text.y = element_text(size = 12), panel.grid = element_blank())
+}
+```
+
+```{r waterfall_plots}
+# Week 0 plots
+plot_waterfall(results_ECs_W0, "Inflam_thrombogenesis", 
+               "Inflammatory Genes - Week 0")
+plot_waterfall(results_ECs_W0, "TNFA_NFkB_activation", 
+               "NFkB Signaling - Week 0")
+
+# Week 12 plots
+plot_waterfall(results_ECs_W12, "Inflam_thrombogenesis", 
+               "Inflammatory Genes - Week 12")
+plot_waterfall(results_ECs_W12, "TNFA_NFkB_activation", 
+               "NFkB Signaling - Week 12")
+```
+
+# 8. MASC Analysis (Exploratory)
+PMID: 30333237
+Mixed-model Association testing for Single Cells (MASC) was performed to test for differential abundance of EC subclusters.
+
+```{r masc_analysis}
+# MASC results (computed externally)
+# Random effect: predicted_doublet
+# Fixed effects: pct_counts_mt, pct_counts_hb, log10genesperUMI, 
+#               log1p_n_genes_by_counts, doublet_score
+#MASC analysis was performed in a separate document for both EC subclusters and on the scale of major vascular cell types
+#The results of MASC analysis can be found in "results_dir/MASC/"
+#The filenames are c(""MACS_EC_WT_Week12vsWeek0.csv",	"MACS_WT_Week12vsWeek0.csv","MACS_EC_Week0_WTvsHet.csv",	"MACS_Week0_WTvsHet.csv","MACS_EC_Week12_WTvsHet.csv","MACS_Week12_WTvsHet.csv")
+```
+
+# 9. CellRank Trajectory Analysis
+
+CellRank analysis was performed in Python to predict cell fate transitions. The delta values represent the difference in fate probabilities between Het and WT conditions.
+
+```{r cellrank_viz}
+#The fate probability data from CellRank2 can be found at "results_dir/CellRank/cellrank_data.xlsx"
+# Fate probability delta: Het - WT
+# Rows: Initial state (current EC subcluster)
+# Columns: Terminal state (predicted future state)
+
+# Week 0 → Week 12 prediction
+data_W0_W12 <- matrix(
+  c(-0.078, -0.082, -0.118, -0.03, -0.036,
+     0.057,  0.099,  0.135,  0.099,  0.089,
+     0.045,  0.027,  0.071,  0.111,  0.014,
+    -0.03,  -0.057, -0.083, -0.13,  -0.008,
+     0.007,  0.014, -0.005, -0.05,  -0.06),
+  nrow = 5, byrow = TRUE
+)
+rownames(data_W0_W12) <- ec_subtypes
+colnames(data_W0_W12) <- ec_subtypes
+
+# Week 12 → Week 24 prediction
+data_W12_W24 <- matrix(
+  c(-0.0960, -0.1121, -0.0815,  0.0407, -0.0617,
+     0.0741,  0.1942,  0.0764,  0.1666,  0.1010,
+     0.0428, -0.0175,  0.0800,  0.1129,  0.0057,
+    -0.0279, -0.0732, -0.0708, -0.3242, -0.0605,
+     0.0071,  0.0086, -0.0041,  0.0040,  0.0155),
+  nrow = 5, byrow = TRUE
+)
+rownames(data_W12_W24) <- ec_subtypes
+colnames(data_W12_W24) <- ec_subtypes
+
+# Determine global color scale
+combined_data <- c(data_W0_W12, data_W12_W24)
+global_min <- min(combined_data)
+global_max <- max(combined_data)
+
+# Plot Week 0 → Week 12
+data_W0_long <- melt(data_W0_W12)
+
+ggplot(data_W0_long, aes(Var2, Var1, fill = value)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient2(
+    low = "blue", mid = "white", high = "#d73027",
+    midpoint = 0, limits = c(global_min, global_max)
+  ) +
+  geom_text(aes(label = round(value, 3)), color = "black", size = 3) +
+  labs(
+    x = "EC subclusters at Week 0\n(initial state)", 
+    y = "Predicted EC states at Week 12\n(terminal state)", 
+    fill = "Change (Het-WT)\nin fate probability",
+    title = "CellRank: Week 0 → Week 12"
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 10),
+    axis.text.y = element_text(size = 10),
+    axis.title = element_text(size = 12, face = "bold")
+  )
+
+# Plot Week 12 → Week 24
+data_W12_long <- melt(data_W12_W24)
+
+ggplot(data_W12_long, aes(Var2, Var1, fill = value)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient2(
+    low = "blue", mid = "white", high = "#d73027",
+    midpoint = 0, limits = c(global_min, global_max)
+  ) +
+  geom_text(aes(label = round(value, 3)), color = "black", size = 3) +
+  labs(
+    x = "EC subclusters at Week 12\n(initial state)", 
+    y = "Predicted EC states at Week 24\n(terminal state)", 
+    fill = "Change (Het-WT)\nin fate probability",
+    title = "CellRank: Week 12 → Week 24"
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 10),
+    axis.text.y = element_text(size = 10),
+    axis.title = element_text(size = 12, face = "bold")
+  )
+```
+
+# 10. Session Info
+
+```{r session_info}
+sessionInfo()
+```
