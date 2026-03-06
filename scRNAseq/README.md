@@ -10,10 +10,10 @@ Raw and processed data are available from GEO: [GSE315884](https://www.ncbi.nlm.
 
 | Sample | Genotype | Timepoint | Description |
 |--------|----------|-----------|-------------|
-| CCM2WTWeek0 | Wild-type | Week 0 | Baseline control |
-| CCM2HetWeek0 | CCM2 Het KO | Week 0 | Baseline mutant |
-| CCM2WTWeek12 | Wild-type | Week 12 | Post-PCSK9 control |
-| CCM2HetWeek12 | CCM2 Het KO | Week 12 | Post-PCSK9 mutant |
+| CCM2WTWeek0 | Wild-type | Week 0 | Baseline WT |
+| CCM2HetWeek0 | CCM2 Het KO | Week 0 | Baseline Het |
+| CCM2WTWeek12 | Wild-type | Week 12 | Atherosclerosis WT |
+| CCM2HetWeek12 | CCM2 Het KO | Week 12 | Atherosclerosis Het |
 
 ## Preprocessing Pipeline
 
