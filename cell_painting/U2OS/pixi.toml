@@ -1,0 +1,38 @@
+[project]
+name = "ccm2-u2os-cell-painting"
+version = "0.1.0"
+description = "CCM2_Val53Ile cell painting classification analysis"
+channels = ["conda-forge"]
+platforms = ["linux-64"]
+
+[dependencies]
+python = ">=3.10"
+polars = ">=0.20"
+pandas = ">=2.0"
+numpy = ">=1.24"
+xgboost = ">=2.0"
+scikit-learn = ">=1.3"
+scikit-image = ">=0.21"
+matplotlib = ">=3.7"
+seaborn = ">=0.12"
+tifffile = ">=2023.0"
+scipy = ">=1.11"
+tqdm = ">=4.65"
+pyarrow = ">=14.0"
+
+[tasks]
+# Classification
+classify = "python scripts/01_xgb_classification.py"
+
+# Data extraction (run once to set up data)
+extract-data = "python scripts/extract_ccm2_profiles.py"
+extract-locations = "python scripts/extract_cell_locations.py"
+
+# Image download (for standalone use without VarChAMP repo)
+download-images = "python scripts/download_cpg_images.py"
+
+# Manuscript figures
+feature-importance = "python scripts/02_feature_importance_figure.py"
+cell-crops = "python scripts/03_cell_crop_figures.py"  # Default: reproduce (10 cells, fixed seed)
+cell-crops-feature = "python scripts/03_cell_crop_figures.py --mode feature"
+cell-crops-all = "python scripts/03_cell_crop_figures.py --mode both"

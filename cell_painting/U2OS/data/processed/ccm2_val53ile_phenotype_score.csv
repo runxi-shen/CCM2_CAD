@@ -1,0 +1,2 @@
+gene_allele,AUROC_standard_mean,AUROC_standard_std,AUROC_gfp_adj_mean,AUROC_gfp_adj_std,n_classifiers_standard,n_classifiers_gfp_adj
+CCM2_Val53Ile,0.9759982331071293,0.035866646871421014,0.980080594719244,0.031001366861609994,32,32
